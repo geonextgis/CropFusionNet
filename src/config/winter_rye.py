@@ -58,7 +58,7 @@ forecast_scenarios = {
     "Jul": 426,
     "Aug": 457,
 }
-forecast_month = "Aug"
+forecast_month = "Jul"
 
 # Config for TFT
 model_config = {
@@ -69,10 +69,10 @@ model_config = {
     "time_varying_categorical_variables": len(time_varying_categorical),
     "time_varying_embedding_vocab_sizes": [],
     "time_varying_real_variables": len(time_varying_real),
-    "lstm_hidden_dimension": 256,
-    "lstm_layers": 2,
+    "lstm_hidden_dimension": 512,
+    "lstm_layers": 3,
     "attn_heads": 4,
-    "pooling_heads": 8,
+    "pooling_heads": 4,
     "dropout": 0.3,
     "embedding_dim": 16,
     "seq_length": forecast_scenarios[forecast_month],
