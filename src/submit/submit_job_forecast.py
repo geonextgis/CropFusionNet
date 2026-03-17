@@ -40,6 +40,7 @@ for month, seq_length in forecast_scenarios.items():
     # 2. Construct Python Command
     python_cmd = (
         f"python train_CropFusionNet.py "
+        f"--crop {CROP} "
         f"--job_id {unique_id} "
         f"--seq_length {seq_length} "
         f"--output_dir {output_base_dir}/{month} "

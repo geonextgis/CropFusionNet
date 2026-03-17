@@ -170,6 +170,7 @@ checkpoints/
 optimization/
 slurm_logs/
 forecast/
+leadtimes/
 baseline/
 *.sh
 *.txt

@@ -11,22 +11,18 @@ sys.path.append(source_folder)
 
 import numpy as np
 import torch
-from dataset.dataset import CropFusionNetDataset
-from loss.loss import QuantileLoss
-from models.CropFusionNet.model import CropFusionNet
 from torch import nn
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+
+from dataset.dataset import CropFusionNetDataset
+from loss.loss import QuantileLoss
+from models.CropFusionNet.model import CropFusionNet
 from utils.utils import evaluate_and_save_outputs, load_config, set_seed
 
-# Crop
-crop = "winter_rye"
-cfg, model_config, train_config = load_config(crop)
-
-device = model_config["device"]
 set_seed(42)
 
 
@@ -35,6 +31,9 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Hyperparameter Tuning")
 
     # 1. Identity & Logging
+    parser.add_argument(
+        "--crop", type=str, required=True, help="Crop name (e.g. winter_wheat)"
+    )
     parser.add_argument(
         "--job_id", type=str, default=str(uuid.uuid4())[:8], help="Unique Job ID"
     )
@@ -195,7 +194,11 @@ if __name__ == "__main__":
     # 1. Parse Arguments
     args = parse_args()
 
-    # 2. UPDATE CONFIGURATION (Must be done FIRST)
+    # 2. Load config for the specified crop
+    cfg, model_config, train_config = load_config(args.crop)
+    device = model_config["device"]
+
+    # 3. UPDATE CONFIGURATION (Must be done FIRST)
     if args.lr:
         train_config["lr"] = args.lr
     if args.batch_size:
@@ -303,18 +306,18 @@ if __name__ == "__main__":
     # ---------------------------------------------------------
     # 5. EVALUATE AND SAVE OUTPUTS
     # ---------------------------------------------------------
-    # print("🔍 Evaluating and saving outputs...")
+    print("🔍 Evaluating and saving outputs...")
 
-    # # Evaluate and save outputs for train, validation, and test datasets
-    # evaluate_and_save_outputs(
-    #     model, train_loader, criterion, device, args.output_dir, "train"
-    # )
-    # evaluate_and_save_outputs(
-    #     model, val_loader, criterion, device, args.output_dir, "validation"
-    # )
-    # evaluate_and_save_outputs(
-    #     model, test_loader, criterion, device, args.output_dir, "test"
-    # )
+    # Evaluate and save outputs for train, validation, and test datasets
+    evaluate_and_save_outputs(
+        model, train_loader, criterion, device, args.output_dir, "train"
+    )
+    evaluate_and_save_outputs(
+        model, val_loader, criterion, device, args.output_dir, "validation"
+    )
+    evaluate_and_save_outputs(
+        model, test_loader, criterion, device, args.output_dir, "test"
+    )
 
     # ---------------------------------------------------------
     # 6. SAVE TUNING RESULTS

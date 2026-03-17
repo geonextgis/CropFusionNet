@@ -56,7 +56,6 @@ forecast_scenarios = {
     "May": 335,
     "Jun": 365,
     "Jul": 396,
-    "Aug": 427,
 }
 forecast_month = "Jul"
 
