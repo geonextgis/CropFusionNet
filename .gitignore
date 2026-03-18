@@ -171,6 +171,7 @@ optimization/
 slurm_logs/
 forecast/
 leadtimes/
+ablation/
 baseline/
 *.sh
 *.txt

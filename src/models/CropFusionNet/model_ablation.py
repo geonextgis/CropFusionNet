@@ -1,0 +1,874 @@
+import math
+
+import matplotlib.pyplot as plt
+import torch
+from torch import nn
+
+
+class TimeDistributed(nn.Module):
+    """
+    A wrapper to apply any module (e.g., nn.Linear, nn.Conv) independently
+    across each timestep of a sequence.
+
+    Input shape:
+        If batch_first=True:  (batch, time, features)
+        Else:                 (time, batch, features)
+
+    Output shape:
+        Matches input, except the last dimension changes to the module's output size.
+    """
+
+    def __init__(self, module, batch_first=True):
+        """
+        Args:
+            module (nn.Module): The layer to apply at each timestep.
+            batch_first (bool): If True, input is (batch, time, features).
+                                If False, input is (time, batch, features).
+        """
+        super().__init__()
+        self.module = module
+        self.batch_first = batch_first
+
+    def forward(self, x):
+        # If input has no time dimension, apply module directly
+        if len(x.size()) <= 2:
+            return self.module(x)
+
+        # Flatten batch and time into one dimension
+        # Example: (batch=32, time=10, features=8) → (320, 8)
+        x_reshape = x.contiguous().view(-1, x.size(-1))
+
+        # Apply the wrapped module (e.g., Linear) to every timestep
+        y = self.module(x_reshape)
+
+        # Reshape back to (batch, time, output_size) or (time, batch, output_size)
+        if self.batch_first:
+            y = y.contiguous().view(
+                x.size(0), -1, y.size(-1)
+            )  # (batch, time, output_size)
+        else:
+            y = y.contiguous().view(
+                x.size(0), x.size(1), y.size(-1)
+            )  # (time, batch, output_size)
+
+        return y
+
+
+class GLU(nn.Module):
+    """Gated Linear Unit for controlling information flow."""
+
+    def __init__(self, input_size: int):
+        super().__init__()
+        self.fc1 = nn.Linear(input_size, input_size)
+        self.fc2 = nn.Linear(input_size, input_size)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of GLU.
+
+        Args:
+            x (Tensor): Input tensor of shape (..., input_size).
+
+        Returns:
+            Tensor: Output tensor of shape (..., input_size).
+        """
+        gate = self.sigmoid(self.fc1(x))  # gating signal
+        transformed = self.fc2(x)  # linear transformation
+        return torch.mul(gate, transformed)  # element-wise gating
+
+
+class GatedResidualNetwork(nn.Module):
+    """
+    Gated Residual Network (GRN)
+
+    A feed-forward block with:
+    - Residual connections
+    - Optional context input
+    - Gating mechanism (GLU)
+    - Normalization and dropout
+    """
+
+    def __init__(
+        self,
+        input_size,
+        hidden_state_size,
+        output_size,
+        dropout,
+        hidden_context_size=None,
+        batch_first=True,
+    ):
+        """
+        Args:
+            input_size (int): Number of features in the input.
+            hidden_state_size (int): Size of the hidden layer.
+            output_size (int): Size of the output features.
+            dropout (float): Dropout probability.
+            hidden_context_size (int, optional): Size of context features (if provided).
+            batch_first (bool): If True, input is (batch, time, features).
+        """
+        super().__init__()
+        self.input_size = input_size
+        self.output_size = output_size
+        self.hidden_state_size = hidden_state_size
+        self.hidden_context_size = hidden_context_size
+
+        # Residual shortcut if input and output sizes differ
+        if self.input_size != self.output_size:
+            self.skip_layer = TimeDistributed(
+                nn.Linear(self.input_size, self.output_size), batch_first=batch_first
+            )
+
+        # First feed-forward layer
+        self.fc1 = TimeDistributed(
+            nn.Linear(self.input_size, self.hidden_state_size), batch_first=batch_first
+        )
+        self.elu = nn.ELU()
+
+        # Optional context projection
+        if self.hidden_context_size is not None:
+            self.context = TimeDistributed(
+                nn.Linear(self.hidden_context_size, self.hidden_state_size),
+                batch_first=batch_first,
+            )
+
+        # Second feed-forward layer
+        self.fc2 = TimeDistributed(
+            nn.Linear(self.hidden_state_size, self.output_size), batch_first=batch_first
+        )
+
+        # Regularization and gating
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(self.output_size)
+        self.gate = TimeDistributed(GLU(self.output_size), batch_first=batch_first)
+
+    def forward(self, x, context=None):
+        """
+        Forward pass of GRN.
+
+        Args:
+            x (Tensor): Input tensor of shape (batch, time, input_size).
+            context (Tensor, optional): Context tensor of shape
+                                        (batch, time, hidden_context_size).
+        Returns:
+            Tensor: Output tensor of shape (batch, time, output_size).
+        """
+        # Residual connection
+        if self.input_size != self.output_size:
+            residual = self.skip_layer(x)
+        else:
+            residual = x
+
+        # First transformation + optional context
+        x = self.fc1(x)
+        if context is not None:
+            context = self.context(context)
+            x = x + context
+        x = self.elu(x)
+
+        # Second transformation
+        x = self.fc2(x)
+        x = self.dropout(x)
+
+        # Gating + residual + normalization
+        x = self.gate(x)
+        x = x + residual
+        x = self.norm(x)
+
+        return x
+
+
+class VariableSelectionNetwork(nn.Module):
+    """
+    Variable Selection Network (VSN)
+
+    Learns to assign weights to different input variables (features)
+    and combines them into a single hidden representation.
+    """
+
+    def __init__(
+        self,
+        input_size,
+        num_inputs,
+        hidden_size,
+        dropout,
+        context=None,
+        batch_first=True,
+    ):
+        """
+        Args:
+            input_size (int): Size of each individual input variable embedding.
+            num_inputs (int): Number of input variables (features).
+            hidden_size (int): Size of hidden layers.
+            dropout (float): Dropout rate.
+            context (int, optional): Context vector size (if used for conditioning).
+        """
+        super().__init__()
+
+        self.hidden_size = hidden_size
+        self.input_size = input_size
+        self.num_inputs = num_inputs
+        self.dropout = dropout
+        self.context = context
+        self.batch_first = batch_first
+
+        # GRN to produce variable selection weights (one per variable)
+        if self.context is not None:
+            self.flattened_grn = GatedResidualNetwork(
+                self.num_inputs * self.input_size,
+                self.hidden_size,
+                self.num_inputs,
+                self.dropout,
+                self.context,
+                self.batch_first,
+            )
+        else:
+            self.flattened_grn = GatedResidualNetwork(
+                self.num_inputs * self.input_size,
+                self.hidden_size,
+                self.num_inputs,
+                self.dropout,
+                batch_first=self.batch_first,
+            )
+
+        # One GRN per input variable to transform it
+        self.single_variable_grns = nn.ModuleList()
+        for i in range(self.num_inputs):
+            self.single_variable_grns.append(
+                GatedResidualNetwork(
+                    self.input_size, self.hidden_size, self.hidden_size, self.dropout
+                )
+            )
+
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, embedding, context=None, variable_mask=None, valid_mask=None):
+        """
+        Forward pass.
+
+        Args:
+            embedding (Tensor): Input embeddings of shape [batch, time, num_inputs * input_size].
+            context (Tensor, optional): Context vector for conditioning.
+            variable_mask (Tensor, optional): Variable Mask [Batch, Time, Num_Inputs].
+                                    1.0 for valid features, 0.0 for missing features.
+            valid_mask (Tensor, optional): Padding Mask [Batch, Time].
+                                           1.0 for valid timesteps, 0.0 for padding/invalid.
+
+        Returns:
+            outputs (Tensor): Combined variable representations [batch, time, hidden_size].
+            sparse_weights (Tensor): Variable selection weights [batch, time, num_inputs, 1].
+        """
+        # Compute selection weights
+        if context is not None:
+            raw_scores = self.flattened_grn(embedding, context)
+        else:
+            raw_scores = self.flattened_grn(embedding)
+
+        if variable_mask is not None:
+            # We replace scores where mask == 0 with -1e9
+            raw_scores = raw_scores.masked_fill(variable_mask == 0, -1e9)
+
+        # Apply Softmax to get weights (0 to 1)
+        sparse_weights = self.softmax(raw_scores).unsqueeze(-1)
+
+        if valid_mask is not None:
+            if valid_mask.ndim == sparse_weights.ndim - 2:
+                # e.g. valid_mask (B, T), sparse_weights (B, T, Inputs, 1)
+                expanded_mask = valid_mask.unsqueeze(-1).unsqueeze(-1)
+            elif valid_mask.ndim == sparse_weights.ndim - 1:
+                # e.g. valid_mask (B), sparse_weights (B, Inputs, 1)
+                expanded_mask = valid_mask.unsqueeze(-1).unsqueeze(-1)
+            else:
+                expanded_mask = valid_mask
+
+            # Force weights to 0.0 where valid_mask
+            sparse_weights = sparse_weights * expanded_mask
+
+        is_time_distributed = len(embedding.shape) == 3
+
+        # Transform each variable separately
+        var_outputs = []
+        for i in range(self.num_inputs):
+            var_slice = embedding[
+                ..., (i * self.input_size) : (i + 1) * self.input_size
+            ]
+            var_outputs.append(self.single_variable_grns[i](var_slice))
+
+        # Dynamic stacking and summing
+        if is_time_distributed:
+            stack_dim = 2
+            sum_dim = 2
+        else:
+            stack_dim = 1
+            sum_dim = 1
+
+        # Stack transformed variables into one tensor
+        var_outputs = torch.stack(var_outputs, dim=stack_dim)
+
+        # Apply selection weights and combine
+        outputs = var_outputs * sparse_weights
+        outputs = outputs.sum(axis=sum_dim)
+
+        return outputs, sparse_weights
+
+
+class MultiScaleTemporalConv(nn.Module):
+    """Lightweight multi-scale 1D convolution block for extracting local temporal patterns."""
+
+    def __init__(self, hidden_size, dropout=0.1):
+        super().__init__()
+        self.conv3 = nn.Conv1d(
+            hidden_size, hidden_size, kernel_size=3, padding=1, groups=hidden_size
+        )
+        self.conv5 = nn.Conv1d(
+            hidden_size, hidden_size, kernel_size=5, padding=2, groups=hidden_size
+        )
+        self.conv7 = nn.Conv1d(
+            hidden_size, hidden_size, kernel_size=7, padding=3, groups=hidden_size
+        )
+        self.projection = nn.Linear(hidden_size * 3, hidden_size)
+        self.norm = nn.LayerNorm(hidden_size)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, mask=None):
+        """
+        Args:
+            x: (B, T, F)
+            mask: (B, T) — 1 for valid, 0 for padding
+        """
+        residual = x
+        x_t = x.permute(0, 2, 1)  # (B, F, T)
+
+        if mask is not None:
+            x_t = x_t * mask.unsqueeze(1)  # zero out padded positions
+
+        c3 = self.conv3(x_t).permute(0, 2, 1)
+        c5 = self.conv5(x_t).permute(0, 2, 1)
+        c7 = self.conv7(x_t).permute(0, 2, 1)
+
+        multi_scale = torch.cat([c3, c5, c7], dim=-1)  # (B, T, 3F)
+        out = self.projection(multi_scale)  # (B, T, F)
+        out = self.dropout(out)
+        return self.norm(out + residual)
+
+
+class PositionalEncoder(nn.Module):
+    """
+    Adds sinusoidal positional encodings to input embeddings so the model
+    can capture the order of timesteps.
+    """
+
+    def __init__(self, d_model: int, max_seq_len: int = 160, batch_first: bool = True):
+        super().__init__()
+        self.d_model = d_model
+        self.batch_first = batch_first
+
+        # Positional encoding matrix
+        pe = torch.zeros(max_seq_len, d_model)
+        position = torch.arange(0, max_seq_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
+        )
+
+        # Calculate the encodings
+        pe[:, 0::2] = torch.sin(position * div_term)  # For even indices
+        pe[:, 1::2] = torch.cos(position * div_term)  # For odd indices
+        self.register_buffer("pe", pe.unsqueeze(0))  # shape: (1, max_seq_len, d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Add positional encoding to input tensor.
+        Args:
+            x: Tensor of shape
+               - (batch, seq_len, d_model) if batch_first=True
+               - (seq_len, batch, d_model) if batch_first=False
+        Returns:
+            Tensor with same shape as input.
+        """
+        if self.batch_first:
+            seq_len = x.size(1)
+            x = x + self.pe[:, :seq_len, :]
+        else:
+            seq_len = x.size(0)
+            x = x + self.pe[:, :seq_len, :].transpose(0, 1)
+        return x
+
+
+class DynamicPyramidalPooling(nn.Module):
+    """
+    Compresses temporal sequences into a fixed-size representation using
+    multi-head attention and dynamic pyramidal fusion.
+    """
+
+    def __init__(self, input_dim, num_heads=4, dropout=0.1):
+        super().__init__()
+        self.num_heads = num_heads
+        self.input_dim = input_dim
+
+        # Outputs scores for ALL heads at once: (Batch, Time, Num_Heads)
+        self.scoring_net = nn.Sequential(
+            nn.Linear(input_dim, input_dim // 2),
+            nn.Tanh(),
+            nn.Linear(input_dim // 2, num_heads),
+        )
+
+        # Dynamic Pyramidal Fusion Construction
+        total_dim = input_dim * num_heads
+        layers = []
+        current_dim = total_dim
+
+        # Automatically build layers: 4096 -> 2048 -> ... -> 256
+        while current_dim > input_dim:
+            next_dim = max(input_dim, current_dim // 2)
+
+            layers.append(nn.Linear(current_dim, next_dim))
+
+            # Add Norm/Act/Drop for all but the final projection
+            if next_dim > input_dim:
+                layers.append(nn.LayerNorm(next_dim))
+                layers.append(nn.GELU())
+                layers.append(nn.Dropout(dropout))
+
+            current_dim = next_dim
+
+        self.head_fusion = nn.Sequential(*layers)
+
+    def forward(self, x, mask=None):
+        """
+        Args:
+            x: (B, T, F)
+            mask: (B, T) where True = padded timestep to ignore
+        """
+        # Compute scores for ALL heads in parallel
+        # scores: (B, T, num_heads)
+        scores = self.scoring_net(x)
+
+        if mask is not None:
+            scores = scores.masked_fill(mask.unsqueeze(-1), -1e9)
+
+        # Compute Attention Weights
+        attn_weights = torch.softmax(scores, dim=1)  # (B, T, num_heads)
+
+        # Vectorized Pooling
+        # b=batch, t=time, h=heads, f=features
+        # We sum over time (t)
+        # Result: (B, num_heads, F)
+        head_outputs = torch.einsum("bth,btf->bhf", attn_weights, x)
+
+        # Flatten for Fusion
+        # (B, num_heads, F) -> (B, num_heads * F)
+        batch_size = x.size(0)
+        combined = head_outputs.reshape(batch_size, -1)
+
+        # Apply Pyramidal Fusion
+        output = self.head_fusion(combined)  # (B, F)
+
+        return output, attn_weights
+
+
+class CropFusionNet(nn.Module):
+    """
+    CropFusionNet (Ablation): A deep learning model for end-season yield forecasting
+    with toggleable components for ablation studies.
+
+    Ablation flags (set in config, all default to True):
+        - use_vsn:               Variable Selection Networks (static & temporal)
+        - use_temporal_conv:     Multi-Scale Temporal Convolution
+        - use_lstm:              LSTM sequence encoder (+ static state init)
+        - use_attention:         Multi-Head Self-Attention (+ positional encoding)
+        - use_static_enrichment: Static-context enrichment of temporal features
+        - use_pyramidal_pooling: Dynamic Pyramidal Pooling (vs. masked mean pooling)
+
+    Args:
+        config (dict): Configuration dictionary containing model hyperparameters.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.device = config["device"]
+        self.hidden_size = config["lstm_hidden_dimension"]
+        self.lstm_layers = config["lstm_layers"]
+        self.attn_heads = config["attn_heads"]
+        self.pooling_heads = config["pooling_heads"]
+        self.dropout = config["dropout"]
+        self.embedding_dim = config["embedding_dim"]
+        self.seq_length = config["seq_length"]
+        self.quantiles = config.get("quantiles", [0.1, 0.5, 0.9])
+
+        self.time_varying_categorical_variables = config[
+            "time_varying_categorical_variables"
+        ]
+        self.time_varying_real_variables = config["time_varying_real_variables"]
+        self.static_categorical_variables = config.get(
+            "static_categorical_variables", 0
+        )
+        self.static_real_variables = config.get("static_real_variables", 0)
+
+        # -------------------- Ablation Flags --------------------
+        self.use_vsn = config.get("use_vsn", True)
+        self.use_temporal_conv = config.get("use_temporal_conv", True)
+        self.use_lstm = config.get("use_lstm", True)
+        self.use_attention = config.get("use_attention", True)
+        self.use_static_enrichment = config.get("use_static_enrichment", True)
+        self.use_pyramidal_pooling = config.get("use_pyramidal_pooling", True)
+
+        # -------------------- 1. Static Embeddings --------------------
+        self.static_embedding_layers = nn.ModuleList()
+        if self.static_categorical_variables > 0:
+            for i in range(self.static_categorical_variables):
+                emb = nn.Embedding(
+                    config["static_embedding_vocab_sizes"][i], self.embedding_dim
+                ).to(self.device)
+                self.static_embedding_layers.append(emb)
+
+        self.static_linear_layers = nn.ModuleList()
+        if self.static_real_variables > 0:
+            for i in range(self.static_real_variables):
+                lin = nn.Linear(1, self.embedding_dim).to(self.device)
+                self.static_linear_layers.append(lin)
+
+        # -------------------- 2. Time-Varying Embeddings --------------------
+        self.time_varying_embedding_layers = nn.ModuleList()
+        for i in range(self.time_varying_categorical_variables):
+            emb = TimeDistributed(
+                nn.Embedding(
+                    config["time_varying_embedding_vocab_sizes"][i], self.embedding_dim
+                ),
+                batch_first=True,
+            ).to(self.device)
+            self.time_varying_embedding_layers.append(emb)
+
+        self.time_varying_linear_layers = nn.ModuleList()
+        for i in range(self.time_varying_real_variables):
+            lin = TimeDistributed(
+                nn.Linear(1, self.embedding_dim), batch_first=True
+            ).to(self.device)
+            self.time_varying_linear_layers.append(lin)
+
+        # -------------------- 3. Variable Selection --------------------
+        self.total_static_dim = self.embedding_dim * (
+            self.static_categorical_variables + self.static_real_variables
+        )
+        self.total_temporal_embedding_dim = self.embedding_dim * (
+            self.time_varying_real_variables + self.time_varying_categorical_variables
+        )
+
+        if self.use_vsn:
+            # Static Selection
+            self.static_context = GatedResidualNetwork(
+                input_size=self.total_static_dim,
+                hidden_state_size=self.hidden_size,
+                output_size=self.hidden_size,
+                dropout=self.dropout,
+            )
+            self.static_variable_selection = VariableSelectionNetwork(
+                self.embedding_dim,
+                (self.static_categorical_variables + self.static_real_variables),
+                self.hidden_size,
+                self.dropout,
+                self.hidden_size,
+            )
+            # Temporal Selection
+            self.temporal_variable_selection = VariableSelectionNetwork(
+                self.embedding_dim,
+                (
+                    self.time_varying_real_variables
+                    + self.time_varying_categorical_variables
+                ),
+                self.hidden_size,
+                self.dropout,
+                self.hidden_size,
+            )
+        else:
+            # Fallback: simple linear projections to hidden_size
+            self.static_proj = nn.Linear(self.total_static_dim, self.hidden_size)
+            self.temporal_proj = TimeDistributed(
+                nn.Linear(self.total_temporal_embedding_dim, self.hidden_size),
+                batch_first=True,
+            )
+
+        if self.use_temporal_conv:
+            self.temporal_conv = MultiScaleTemporalConv(self.hidden_size, self.dropout)
+
+        # -------------------- 4. Sequence Processing --------------------
+        if self.use_lstm:
+            self.lstm = nn.LSTM(
+                input_size=self.hidden_size,
+                hidden_size=self.hidden_size,
+                num_layers=self.lstm_layers,
+                dropout=self.dropout if self.lstm_layers > 1 else 0,
+                batch_first=True,
+                bidirectional=False,
+            )
+            # Static-to-LSTM state initialization
+            self.static_to_h = nn.Linear(
+                self.hidden_size, self.hidden_size * self.lstm_layers
+            )
+            self.static_to_c = nn.Linear(
+                self.hidden_size, self.hidden_size * self.lstm_layers
+            )
+            # Post-LSTM Gate & Norm
+            self.post_lstm_gate = TimeDistributed(GLU(self.hidden_size))
+            self.post_lstm_norm = nn.LayerNorm(self.hidden_size)
+
+        # Static Enrichment
+        if self.use_static_enrichment:
+            self.static_enrichment = GatedResidualNetwork(
+                self.hidden_size,
+                self.hidden_size,
+                self.hidden_size,
+                self.dropout,
+                self.hidden_size,
+            )
+
+        # Attention Mechanism
+        if self.use_attention:
+            self.position_encoding = PositionalEncoder(
+                self.hidden_size, self.seq_length
+            )
+            self.multihead_attn = nn.MultiheadAttention(
+                self.hidden_size, self.attn_heads
+            )
+            self.post_attn_gate = TimeDistributed(GLU(self.hidden_size))
+            self.post_attn_norm = nn.LayerNorm(self.hidden_size)
+
+        # -------------------- 5. Pooling Mechanism --------------------
+        if self.use_pyramidal_pooling:
+            self.pyramidal_pooling = DynamicPyramidalPooling(
+                self.hidden_size, self.pooling_heads, self.dropout
+            )
+
+        # -------------------- 6. Output Projection --------------------
+        self.output_projection = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.LayerNorm(self.hidden_size),
+            nn.GELU(),
+        )
+        self.quantile_head = nn.Linear(self.hidden_size, len(self.quantiles)).to(
+            self.device
+        )
+
+    def get_static_embedding(self, x):
+        """
+        Generate static embeddings for categorical and real-valued static features.
+
+        Args:
+            x (dict): Input dictionary containing static features.
+
+        Returns:
+            torch.Tensor: Static embeddings of shape (batch_size, total_static_dim).
+        """
+        embedding_vectors = []
+        # Static categorical
+        for i in range(self.static_categorical_variables):
+            emb = self.static_embedding_layers[i](
+                x["identifier"][:, 0, i].long().to(self.device)
+            )
+            embedding_vectors.append(emb)
+        # Static real
+        for j in range(self.static_real_variables):
+            emb = self.static_linear_layers[j](
+                x["identifier"][:, 0, self.static_categorical_variables + j]
+                .view(-1, 1)
+                .float()
+                .to(self.device)
+            )
+            embedding_vectors.append(emb)
+        return torch.cat(embedding_vectors, dim=1)
+
+    def apply_temporal_embedding(self, x_input):
+        """
+        Generate temporal embeddings for time-varying categorical and real-valued features.
+
+        Args:
+            x_input (torch.Tensor): Input tensor of shape (batch_size, seq_length, num_features).
+
+        Returns:
+            torch.Tensor: Temporal embeddings of shape (batch_size, seq_length, embedding_dim).
+        """
+        # x_input shape: (Batch, Time, Real_Vars + Cat_Vars)
+        embeddings = []
+
+        # Real variables
+        for i in range(self.time_varying_real_variables):
+            # Assumes real vars come first in the input tensor
+            val = x_input[:, :, i].unsqueeze(-1).float()
+            embeddings.append(self.time_varying_linear_layers[i](val))
+
+        # Categorical Variables
+        for i in range(self.time_varying_categorical_variables):
+            # Assumes cat vars come after real vars
+            idx = self.time_varying_real_variables + i
+            val = x_input[:, :, idx].long()
+            embeddings.append(self.time_varying_embedding_layers[i](val))
+
+        return torch.cat(embeddings, dim=2)
+
+    def forward(self, x):
+        """
+        Forward pass of the CropFusionNet model with ablation support.
+
+        Components can be toggled via config flags:
+            use_vsn, use_temporal_conv, use_lstm, use_attention,
+            use_static_enrichment, use_pyramidal_pooling.
+
+        All tensors flowing through the network maintain shape (B, T, hidden_size)
+        for the temporal path and (B, hidden_size) for the static path, regardless
+        of which components are enabled.
+
+        Args:
+            x (dict): Input dictionary containing:
+                - "identifier": Static features.
+                - "inputs": Temporal features (batch, seq_length, num_features).
+                - "variable_mask": Temporal feature mask (batch, seq_length, num_features).
+                - "mask": Sequence mask (batch, seq_length).
+
+        Returns:
+            dict: Model outputs including predictions, weights, and attention scores.
+        """
+        batch_size = x["inputs"].size(0)
+        valid_mask = x.get("mask").to(self.device)  # (B, T)
+
+        # ============================================================
+        # 1. Static Context Processing
+        # ============================================================
+        # static_embedding_raw: (B, total_static_dim)
+        static_embedding_raw = self.get_static_embedding(x)
+
+        if self.use_vsn:
+            static_context = self.static_context(static_embedding_raw)
+            # static_embedding: (B, hidden_size), static_weights: (B, num_static, 1)
+            static_embedding, static_weights = self.static_variable_selection(
+                static_embedding_raw, static_context
+            )
+        else:
+            # Fallback: project concatenated static embeddings → hidden_size
+            static_embedding = self.static_proj(
+                static_embedding_raw
+            )  # (B, hidden_size)
+            static_weights = None
+
+        # ============================================================
+        # 2. Temporal Input Processing
+        # ============================================================
+        # temporal_embeddings: (B, T, num_vars * embedding_dim)
+        temporal_embeddings = self.apply_temporal_embedding(x["inputs"].to(self.device))
+
+        if self.use_vsn:
+            # temporal_context from static: (B, hidden_size) → (B, T, hidden_size)
+            temporal_context = static_embedding.unsqueeze(1).expand(
+                -1, temporal_embeddings.size(1), -1
+            )
+            temporal_features, temporal_weights = self.temporal_variable_selection(
+                temporal_embeddings,
+                context=temporal_context,
+                variable_mask=x.get("variable_mask", None).to(self.device),
+                valid_mask=valid_mask if valid_mask is not None else None,
+            )
+        else:
+            # Fallback: project raw temporal embeddings → hidden_size
+            temporal_features = self.temporal_proj(
+                temporal_embeddings
+            )  # (B, T, hidden_size)
+            temporal_weights = None
+            # Still build temporal_context for downstream components that may need it
+            temporal_context = static_embedding.unsqueeze(1).expand(
+                -1, temporal_features.size(1), -1
+            )
+
+        # ============================================================
+        # 2b. Multi-Scale Temporal Convolution
+        # ============================================================
+        if self.use_temporal_conv:
+            temporal_features = self.temporal_conv(temporal_features, valid_mask)
+        # else: temporal_features stays as-is (B, T, hidden_size) — no shape change
+
+        # ============================================================
+        # 3. LSTM Processing
+        # ============================================================
+        if self.use_lstm:
+            # Initialize LSTM states from static context
+            h0 = self.static_to_h(static_embedding)  # (B, hidden * layers)
+            h0 = (
+                h0.view(batch_size, self.lstm_layers, self.hidden_size)
+                .permute(1, 0, 2)
+                .contiguous()
+            )
+            c0 = self.static_to_c(static_embedding)
+            c0 = (
+                c0.view(batch_size, self.lstm_layers, self.hidden_size)
+                .permute(1, 0, 2)
+                .contiguous()
+            )
+
+            lstm_output, _ = self.lstm(temporal_features, (h0, c0))
+
+            # Skip connection & Gating
+            sequence_output = self.post_lstm_gate(lstm_output + temporal_features)
+            sequence_output = self.post_lstm_norm(sequence_output)
+        else:
+            # Skip LSTM: temporal features pass through directly
+            sequence_output = temporal_features  # (B, T, hidden_size)
+
+        # ============================================================
+        # 4. Self-Attention
+        # ============================================================
+        self_attn_weights = None
+        if self.use_attention:
+            sequence_output = self.position_encoding(sequence_output)
+            # nn.MultiheadAttention expects (T, B, F)
+            seq_t = sequence_output.transpose(0, 1)
+            attn_output, self_attn_weights = self.multihead_attn(
+                seq_t,
+                seq_t,
+                seq_t,
+                key_padding_mask=~valid_mask.bool() if valid_mask is not None else None,
+            )
+            attn_output = attn_output.transpose(0, 1)  # back to (B, T, F)
+
+            # Gated skip connection + norm
+            sequence_output = self.post_attn_gate(attn_output + sequence_output)
+            sequence_output = self.post_attn_norm(sequence_output)
+
+            # Mask attention weights for interpretability
+            if valid_mask is not None:
+                row_mask = valid_mask.unsqueeze(-1)
+                self_attn_weights = self_attn_weights * row_mask
+        # else: sequence_output stays as-is (B, T, hidden_size)
+
+        # ============================================================
+        # 4b. Static Enrichment
+        # ============================================================
+        if self.use_static_enrichment:
+            sequence_output = self.static_enrichment(sequence_output, temporal_context)
+        # else: skip fusing static context into the temporal sequence
+
+        # ============================================================
+        # 5. Pooling & Output
+        # ============================================================
+        pooled_weights = None
+        if self.use_pyramidal_pooling:
+            pooled_output, pooled_weights = self.pyramidal_pooling(
+                sequence_output, ~valid_mask.bool()
+            )
+        else:
+            # Fallback: masked mean pooling over time
+            if valid_mask is not None:
+                mask_expanded = valid_mask.unsqueeze(-1).float()  # (B, T, 1)
+                pooled_output = (sequence_output * mask_expanded).sum(dim=1) / (
+                    mask_expanded.sum(dim=1).clamp(min=1.0)
+                )  # (B, hidden_size)
+            else:
+                pooled_output = sequence_output.mean(dim=1)  # (B, hidden_size)
+
+        projected = self.output_projection(pooled_output)
+        quantiles = self.quantile_head(projected)
+
+        return {
+            "prediction": quantiles,
+            "static_weights": static_weights,
+            "temporal_weights": temporal_weights,
+            "attention_weights": self_attn_weights,
+            "pooled_weights": pooled_weights,
+            "latent": pooled_output,
+        }
